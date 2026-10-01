@@ -1,36 +1,96 @@
-import { Component, MarkdownRenderer, Notice, TFile, moment } from 'obsidian';
+import dayjs, { type Dayjs } from 'dayjs';
+import { Component, MarkdownRenderer, Notice, TFile, TFolder, moment } from 'obsidian';
 import type { App } from 'obsidian';
-import dayjs, { Dayjs } from 'dayjs';
-import type {
-  DailyRecordType,
-  PeriodicNotesTemplateFilePath,
-  ResourceType,
-} from './type';
-import { LogLevel, PluginSettings } from './type';
 import {
   DAILY,
-  WEEKLY,
+  ERROR_MESSAGE,
+  FULL_DAILY_REG,
+  FULL_MONTHLY_REG,
+  FULL_QUARTERLY_REG,
+  FULL_WEEKLY_REG,
+  FULL_YEARLY_REG,
+  LIFE_OS_OFFICIAL_SITE,
   MONTHLY,
   QUARTERLY,
+  WEEKLY,
   YEARLY,
-  LIFE_OS_OFFICIAL_SITE,
-  ERROR_MESSAGE,
 } from './constant';
-import { I18N_MAP } from './i18n';
+import { getDayjsLocale, getI18n, getLocale, normalizeLocale } from './i18n';
+import type { DailyRecordType, DailyRecordTypeV2, PeriodicNotesTemplateFilePath, ResourceType } from './type';
+import { LogLevel, type PluginSettings } from './type';
 
 export function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-export function renderError(
-  app: App,
-  msg: string,
-  containerEl: HTMLElement,
-  sourcePath: string
-) {
+/**
+ * Join path segments into a normalized, vault-relative path.
+ *
+ * `Vault.getAbstractFileByPath()` does NOT normalize the path it receives,
+ * while `Vault.create()` does. Building a path with a template literal such as
+ * `` `${settings.periodicNotesPath}/${year}/...` `` therefore yields a double
+ * slash whenever `periodicNotesPath` is `/` (vault root) or has a trailing
+ * slash — e.g. `//2026/Daily/10/2026-10-01.md`. The lookup then silently
+ * misses the existing file, so `createFile()` falls through to
+ * `Vault.create()` and throws `Error: File already exists.`
+ */
+export function joinVaultPath(...segments: Array<string | undefined | null>): string {
+  return segments
+    .map((segment) => String(segment ?? '').replace(/^\/+|\/+$/g, ''))
+    .filter((segment) => segment.length > 0)
+    .join('/');
+}
+
+/**
+ * Normalize `settings.periodicNotesPath` for prefix checks and regex building.
+ * `/` (vault root) and `Foo/` both normalize to `Foo`; the root normalizes to `''`.
+ */
+export function normalizePeriodicNotesPath(periodicNotesPath: string | undefined | null): string {
+  return String(periodicNotesPath ?? '').replace(/^\/+|\/+$/g, '');
+}
+
+/**
+ * Whether `path` lives inside the configured periodic-notes folder.
+ * A `periodicNotesPath` of `/` means "vault root" and matches every path.
+ */
+export function isInPeriodicNotesFolder(path: string | undefined, settings: PluginSettings | undefined): boolean {
+  if (!settings?.periodicNotesPath) {
+    return false;
+  }
+
+  const base = normalizePeriodicNotesPath(settings.periodicNotesPath);
+
+  if (!base) {
+    return true;
+  }
+
+  return path === base || !!path?.startsWith(`${base}/`);
+}
+
+/** Escape a literal string so it can be embedded in a `RegExp`. */
+export function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export function renderError(app: App, msg: string, containerEl: HTMLElement, sourcePath: string) {
   const component = new Component();
 
   return MarkdownRenderer.render(app, msg, containerEl, sourcePath, component);
+}
+
+async function ensureFolderTree(app: App, folder: string): Promise<void> {
+  const segments = folder.split('/').filter(Boolean);
+  let currentPath = '';
+
+  for (const segment of segments) {
+    currentPath = currentPath ? `${currentPath}/${segment}` : segment;
+    const existing = app.vault.getAbstractFileByPath(currentPath);
+
+    if (existing instanceof TFolder) continue;
+    if (existing) throw new Error(`A file already exists where a folder is required: ${currentPath}`);
+
+    await app.vault.createFolder(currentPath);
+  }
 }
 
 export async function createFile(
@@ -41,20 +101,19 @@ export async function createFile(
     folder: string;
     file: string;
     tag?: string;
-  }
+    newLeaf?: boolean;
+  },
 ) {
   if (!app) {
     return;
   }
 
-  const { templateFile, folder, file, tag, locale } = options;
+  const { templateFile, folder, file, tag, locale, newLeaf } = options;
   const templateTFile = app.vault.getAbstractFileByPath(templateFile!);
   const finalFile = file.match(/\.md$/) ? file : `${file}.md`;
 
   if (!templateTFile) {
-    return new Notice(
-      I18N_MAP[locale][`${ERROR_MESSAGE}NO_TEMPLATE_EXIST`] + templateFile
-    );
+    return new Notice(getI18n(locale)[`${ERROR_MESSAGE}NO_TEMPLATE_EXIST`] + templateFile);
   }
 
   if (templateTFile instanceof TFile) {
@@ -67,12 +126,11 @@ export async function createFile(
     const tFile = app.vault.getAbstractFileByPath(finalFile);
 
     if (tFile && tFile instanceof TFile) {
-      return await app.workspace.getLeaf().openFile(tFile);
+      await app.workspace.getLeaf(newLeaf).openFile(tFile);
+      return tFile;
     }
 
-    if (!app.vault.getAbstractFileByPath(folder)) {
-      app.vault.createFolder(folder);
-    }
+    await ensureFolderTree(app, folder);
 
     const fileCreated = await app.vault.create(finalFile, templateContent);
 
@@ -83,9 +141,11 @@ export async function createFile(
 
       frontMatter.tags = frontMatter.tags || [];
       frontMatter.tags.push(tag.replace(/^#/, ''));
+      frontMatter.aliases = tag;
     });
     await sleep(30); // 等待被索引，否则读取不到 frontmatter：this.app.metadataCache.getFileCache(file)
-    await app.workspace.getLeaf().openFile(fileCreated);
+    await app.workspace.getLeaf(newLeaf).openFile(fileCreated);
+    return fileCreated;
   }
 }
 
@@ -98,7 +158,7 @@ export function isBulletList(content: string) {
   return /^([-*\u2022]|\d+\.) .*/.test(content);
 }
 
-export function formatDailyRecord(record: DailyRecordType) {
+export function formatDailyRecord(record: DailyRecordType, dailyRecordTag?: string) {
   const { createdTs, createdAt, content, resourceList } = record;
   const timeStamp = createdAt ? moment(createdAt).unix() : createdTs;
   const [date, time] = moment(timeStamp * 1000)
@@ -111,34 +171,63 @@ export function formatDailyRecord(record: DailyRecordType) {
   let targetFirstLine = '';
 
   if (isTask) {
-    targetFirstLine = `- [ ] ${time} ${firstLine.replace(/^- \[.*?\]/, '')}`;
+    targetFirstLine = `- [ ] ${time} ${firstLine.replace(/^- \[.*?\] /, '')}`;
   } else if (isCode) {
     targetFirstLine = `- ${time}`; // 首行不允许存在代码片段
     otherLine.unshift(firstLine);
   } else {
-    targetFirstLine = `- ${time} ${firstLine.replace(/^- /, '')}`;
+    targetFirstLine = `- ${time} ${firstLine.replace(/^- /, '').trim()}`;
   }
 
-  targetFirstLine += ` #daily-record ^${timeStamp}`;
+  // Add custom tag if provided and not empty
+  const tag = dailyRecordTag?.trim();
+  if (tag) {
+    // Ensure tag starts with # if it doesn't already
+    const formattedTag = tag.startsWith('#') ? tag : `#${tag}`;
+    targetFirstLine += `${firstLine ? ' ' : ''}${formattedTag} ^${timeStamp}`;
+  } else {
+    targetFirstLine += ` ^${timeStamp}`;
+  }
 
   const targetOtherLine = otherLine?.length //剩余行
-    ? '\n' +
-    otherLine
-      .filter((line: string) => line.trim())
-      .map((line: string) => `\t${isBulletList(line) ? line : `- ${line}`}`)
-      .join('\n')
-      .trimEnd()
+    ? `\n${otherLine
+        .filter((line: string) => line.trim())
+        .map((line: string) => `\t${isBulletList(line) ? line : `- ${line}`}`)
+        .join('\n')
+        .trimEnd()}`
     : '';
   const targetResourceLine = resourceList?.length // 资源文件
-    ? '\n' +
-    resourceList
-      ?.map((resource: ResourceType) => `\t- ${generateFileLink(resource)}`)
-      .join('\n')
+    ? `\n${resourceList?.map((resource: ResourceType) => `\t- ${generateFileLink(resource)}`).join('\n')}`
     : '';
-  const finalTargetContent =
-    targetFirstLine + targetOtherLine + targetResourceLine;
+  const finalTargetContent = targetFirstLine + targetOtherLine + targetResourceLine;
 
   return [date, timeStamp, finalTargetContent].map(String);
+}
+
+export function transformV2Record(record: DailyRecordTypeV2) {
+  // Handle both resources (legacy) and attachments (v0.25.0+)
+  const resourceList =
+    record.resources ||
+    (record.attachments
+      ? record.attachments.map((attachment) => ({
+          id: attachment.name,
+          name: attachment.name,
+          filename: attachment.filename,
+          externalLink: attachment.external_link || attachment.externalLink,
+          type: attachment.type,
+          uid: attachment.name,
+        }))
+      : undefined);
+
+  return {
+    updatedTs: new Date(record.updateTime).getTime() / 1000,
+    createdTs: new Date(record.createTime).getTime() / 1000,
+    createdAt: new Date(record.createTime).toISOString(),
+    updatedAt: new Date(record.updateTime).toISOString(),
+    content: record.content,
+    rowStatus: record.rowStatus,
+    resourceList,
+  };
 }
 
 export function generateFileLink(resource: ResourceType): string {
@@ -148,12 +237,31 @@ export function generateFileLink(resource: ResourceType): string {
 
   const prefix = resource.type?.includes('image') ? '!' : ''; // only add ! for image type
 
-  return `${prefix}[${resource.name || resource.filename}](${resource.externalLink
-    })`;
+  return `${prefix}[${resource.name || resource.filename}](${resource.externalLink})`;
 }
 
 export function generateFileName(resource: ResourceType): string {
-  return `${resource.id}-${resource.filename.replace(/[/\\?%*:|"<>]/g, '-')}`;
+  let resourceId = resource.id;
+
+  // If no ID, fall back to name processing
+  if (!resourceId) {
+    const name = resource.name;
+    if (name?.includes('/')) {
+      // For compatibility: check if it's the new "attachments/xxx" format
+      if (name.startsWith('attachments/')) {
+        // New v2.5 format: "attachments/xxx" -> take "xxx"
+        resourceId = name.replace('attachments/', '');
+      } else {
+        // Original v1/v2 logic: "xxx/yyy" -> take "yyy" (index [1])
+        resourceId = name.split('/')[1] || name.split('/').pop() || name;
+      }
+    } else {
+      resourceId = name || '';
+    }
+  }
+
+  const fileName = `${resourceId}-${resource.filename.replace(/[/\\?%*:|"<>]/g, '-')}`;
+  return fileName;
 }
 
 export function logMessage(message: string, level: LogLevel = LogLevel.info) {
@@ -170,10 +278,9 @@ export function logMessage(message: string, level: LogLevel = LogLevel.info) {
 }
 
 export function generateHeaderRegExp(header: string) {
-  const formattedHeader = /^#+/.test(header.trim())
-    ? header.trim()
-    : `# ${header.trim()}`;
-  const reg = new RegExp(`(${formattedHeader}[^\n]*)([\\s\\S]*?)(?=\\n##|$)`);
+  const formattedHeader = /^#+/.test(header.trim()) ? header.trim() : `# ${header.trim()}`;
+  const level = formattedHeader.match(/^#+/)![0].length;
+  const reg = new RegExp(`(${formattedHeader}[^\n]*)([\\s\\S]*?)(?=\\n#{1,${level}}(?!#)|$)`);
 
   return reg;
 }
@@ -182,14 +289,16 @@ export async function createPeriodicFile(
   day: Dayjs,
   periodType: string,
   settings: PluginSettings,
-  app: App | undefined
-): Promise<void> {
+  app: App | undefined,
+  newLeaf: boolean = false,
+  locale?: string,
+): Promise<TFile | void> {
   if (!app || !settings.periodicNotesPath) {
     return;
   }
 
-  const locale = window.localStorage.getItem('language') || 'en';
-  const date = dayjs(day.format()).locale(locale);
+  const effectiveLocale = getDayjsLocale(locale || getLocale());
+  const date = dayjs(day.format()).locale(effectiveLocale);
 
   let templateFile = '';
   let folder = '';
@@ -197,53 +306,120 @@ export async function createPeriodicFile(
 
   const year = date.format('YYYY');
   let value;
-  let month_number = String(date.month() + 1).padStart(2, '0')
 
   if (periodType === DAILY) {
-    // folder = `${settings.periodicNotesPath}/${year}/${periodType}/${String(
-    //   date.month() + 1
-    // ).padStart(2, '0')}`;
-    folder = `${settings.periodicNotesPath}/${year}/${month_number}`;
-    value = date.format('YYYY-MM-DD');
+    folder = joinVaultPath(settings.periodicNotesPath, year, periodType, String(date.month() + 1).padStart(2, '0'));
+    value = date.format(settings.dailyNoteFormat || 'YYYY-MM-DD');
   } else if (periodType === WEEKLY) {
-    // folder = `${settings.periodicNotesPath}/${date.format(
-    //   'gggg'
-    // )}/${periodType}`;
-    folder = `${settings.periodicNotesPath}/${date.format(
-      'gggg'
-    )}/${month_number}`;
-    value = date.format('gggg-[W]ww');
+    folder = joinVaultPath(settings.periodicNotesPath, date.format('gggg'), periodType);
+    value = date.format(settings.weeklyNoteFormat || 'gggg-[W]ww');
   } else if (periodType === MONTHLY) {
-    // folder = `${settings.periodicNotesPath}/${year}/${periodType}`;
-    folder = `${settings.periodicNotesPath}/${year}`;
-    value = date.format('YYYY-MM');
+    folder = joinVaultPath(settings.periodicNotesPath, year, periodType);
+    value = date.format(settings.monthlyNoteFormat || 'YYYY-MM');
   } else if (periodType === QUARTERLY) {
-    // folder = `${settings.periodicNotesPath}/${year}/${periodType}`;
-    folder = `${settings.periodicNotesPath}/${year}`;
-    value = date.format('YYYY-[Q]Q');
+    folder = joinVaultPath(settings.periodicNotesPath, year, periodType);
+    value = date.format(settings.quarterlyNoteFormat || 'YYYY-[Q]Q');
   } else if (periodType === YEARLY) {
-    folder = `${settings.periodicNotesPath}/${year}`;
-    value = year;
+    folder = joinVaultPath(settings.periodicNotesPath, year);
+    value = settings.yearlyNoteFormat ? date.format(settings.yearlyNoteFormat) : year;
   }
 
-  file = `${folder}/${value}.md`;
+  file = joinVaultPath(folder, `${value}.md`);
   templateFile = settings.usePeriodicAdvanced
-    ? settings[
-    `periodicNotesTemplateFilePath${periodType}` as PeriodicNotesTemplateFilePath
-    ] || `${settings.periodicNotesPath}/Templates/${periodType}.md`
-    : `${settings.periodicNotesPath}/Templates/${periodType}.md`;
-  await createFile(app, {
-    locale,
+    ? settings[`periodicNotesTemplateFilePath${periodType}` as PeriodicNotesTemplateFilePath] ||
+      joinVaultPath(settings.periodicNotesPath, 'Templates', `${periodType}.md`)
+    : joinVaultPath(settings.periodicNotesPath, 'Templates', `${periodType}.md`);
+  const fileCreated = await createFile(app, {
+    locale: locale || getLocale(),
     templateFile,
     folder,
     file,
+    newLeaf,
   });
+
+  return fileCreated instanceof TFile ? fileCreated : undefined;
 }
 
 export function openOfficialSite(locale: string) {
-  if (locale === 'zh-cn') {
+  if (normalizeLocale(locale).startsWith('zh')) {
     return (window.location.href = `${LIFE_OS_OFFICIAL_SITE}/zh`);
   }
 
   return (window.location.href = LIFE_OS_OFFICIAL_SITE);
 }
+
+export function generateIgnoreOperator(settings: PluginSettings) {
+  const {
+    periodicNotesPath,
+    periodicNotesTemplateFilePathYearly,
+    periodicNotesTemplateFilePathQuarterly,
+    periodicNotesTemplateFilePathMonthly,
+    periodicNotesTemplateFilePathWeekly,
+    periodicNotesTemplateFilePathDaily,
+  } = settings;
+
+  return [
+    joinVaultPath(periodicNotesPath, 'Templates'),
+    periodicNotesTemplateFilePathYearly,
+    periodicNotesTemplateFilePathQuarterly,
+    periodicNotesTemplateFilePathMonthly,
+    periodicNotesTemplateFilePathWeekly,
+    periodicNotesTemplateFilePathDaily,
+  ]
+    .filter((path) => path)
+    .map((path) => `AND -"${path}"`)
+    .join(' ');
+}
+
+export function getAllTemplateFiles(settings: PluginSettings) {
+  // TODO: settings 应该统一初始化为实际的设置
+  const {
+    projectsTemplateFilePath,
+    areasTemplateFilePath,
+    resourcesTemplateFilePath,
+    archivesTemplateFilePath,
+    periodicNotesPath,
+    periodicNotesTemplateFilePathYearly,
+    periodicNotesTemplateFilePathQuarterly,
+    periodicNotesTemplateFilePathMonthly,
+    periodicNotesTemplateFilePathWeekly,
+    periodicNotesTemplateFilePathDaily,
+  } = settings;
+
+  return [
+    'Template.md',
+    joinVaultPath(periodicNotesPath, 'Templates'),
+    projectsTemplateFilePath,
+    areasTemplateFilePath,
+    resourcesTemplateFilePath,
+    archivesTemplateFilePath,
+    periodicNotesTemplateFilePathYearly,
+    periodicNotesTemplateFilePathQuarterly,
+    periodicNotesTemplateFilePathMonthly,
+    periodicNotesTemplateFilePathWeekly,
+    periodicNotesTemplateFilePathDaily,
+  ].filter((path) => path);
+}
+
+export function isInTemplateNote(path: string, settings: PluginSettings) {
+  return getAllTemplateFiles(settings).some((template) => path.includes(template));
+}
+
+export function isInPeriodicNote(path: string, settings: PluginSettings) {
+  const prefix = normalizePeriodicNotesPath(settings.periodicNotesPath);
+  const folderPrefix = prefix ? `${escapeRegExp(prefix)}/` : '';
+
+  return (
+    path?.match(new RegExp(`${folderPrefix}${FULL_YEARLY_REG.source}`)) ||
+    path?.match(new RegExp(`${folderPrefix}${FULL_QUARTERLY_REG.source}`)) ||
+    path?.match(new RegExp(`${folderPrefix}${FULL_MONTHLY_REG.source}`)) ||
+    path?.match(new RegExp(`${folderPrefix}${FULL_WEEKLY_REG.source}`)) ||
+    path?.match(new RegExp(`${folderPrefix}${FULL_DAILY_REG.source}`))
+  );
+}
+
+export const getFirstDay = (weekStart = -1, locale: string | undefined) => {
+  // 识别所有中文 locale（zh, zh-cn, zh-tw 等），默认周一开始
+  const isZhLocale = locale?.toLowerCase()?.startsWith('zh');
+  return weekStart === -1 ? (isZhLocale ? 1 : 0) : weekStart;
+};
